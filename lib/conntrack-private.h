@@ -21,6 +21,7 @@
 #include <netinet/in.h>
 #include <netinet/ip6.h>
 
+#include "cmap.h"
 #include "conntrack.h"
 #include "ct-dpif.h"
 #include "openvswitch/hmap.h"
@@ -51,16 +52,9 @@ BUILD_ASSERT_DECL(sizeof(struct ct_endpoint) == sizeof(struct ct_addr) + 4);
 struct conn_key {
     struct ct_endpoint src;
     struct ct_endpoint dst;
-
     ovs_be16 dl_type;
     uint16_t zone;
     uint8_t nw_proto;
-};
-
-struct nat_conn_key_node {
-    struct hmap_node node;
-    struct conn_key key;
-    struct conn_key value;
 };
 
 /* This is used for alg expectations; an expectation is a
@@ -87,26 +81,42 @@ struct alg_exp_node {
     bool nat_rpl_dst;
 };
 
+struct OVS_LOCKABLE ct_ce_lock {
+    struct ovs_mutex lock;
+};
+
 struct conn {
     struct conn_key key;
     struct conn_key rev_key;
     /* Only used for orig_tuple support. */
     struct conn_key master_key;
+    struct ct_ce_lock lock;
     long long expiration;
     struct ovs_list exp_node;
-    struct hmap_node node;
+    struct cmap_node cm_node;
     ovs_u128 label;
-    /* XXX: consider flattening. */
     struct nat_action_info_t *nat_info;
     char *alg;
+    struct conn *nat_conn;
     int seq_skew;
     uint32_t mark;
+    /* See ct_conn_type. */
     uint8_t conn_type;
-    /* TCP sequence skew due to NATTing of FTP control messages. */
-    uint8_t seq_skew_dir;
+    /* Update expiry list id of which there are 'N_CT_TM' possible values.
+     * This field is used to signal an update to the specified list.  The
+     * value 'NO_UPD_EXP_LIST' is used to indicate no update to any list. */
+    uint8_t exp_list_id;
+    /* TCP sequence skew direction due to NATTing of FTP control messages;
+     * true if reply direction. */
+    bool seq_skew_dir;
     /* True if alg data connection. */
-    uint8_t alg_related;
+    bool alg_related;
+    /* Inserted into the cmap; handle theoretical expiry list race; although
+     * such a race would probably mean a system meltdown. */
+    bool inserted;
 };
+
+#define NO_UPD_EXP_LIST 255
 
 enum ct_update_res {
     CT_UPDATE_INVALID,
@@ -119,68 +129,70 @@ enum ct_conn_type {
     CT_CONN_TYPE_UN_NAT,
 };
 
-/* Locking:
- *
- * The connections are kept in different buckets, which are completely
- * independent. The connection bucket is determined by the hash of its key.
- *
- * Each bucket has two locks. Acquisition order is, from outermost to
- * innermost:
- *
- *    cleanup_mutex
- *    lock
- *
- * */
-struct conntrack_bucket {
-    /* Protects 'connections' and 'exp_lists'.  Used in the fast path */
-    struct ct_lock lock;
-    /* Contains the connections in the bucket, indexed by 'struct conn_key' */
-    struct hmap connections OVS_GUARDED;
-    /* For each possible timeout we have a list of connections. When the
-     * timeout of a connection is updated, we move it to the back of the list.
-     * Since the connection in a list have the same relative timeout, the list
-     * will be ordered, with the oldest connections to the front. */
-    struct ovs_list exp_lists[N_CT_TM] OVS_GUARDED;
-
-    /* Protects 'next_cleanup'. Used to make sure that there's only one thread
-     * performing the cleanup. */
-    struct ovs_mutex cleanup_mutex;
-    long long next_cleanup OVS_GUARDED;
-};
+extern struct ct_l4_proto ct_proto_tcp;
+extern struct ct_l4_proto ct_proto_other;
+extern struct ct_l4_proto ct_proto_icmp4;
+extern struct ct_l4_proto ct_proto_icmp6;
 
 struct ct_l4_proto {
-    struct conn *(*new_conn)(struct conntrack_bucket *, struct dp_packet *pkt,
-                             long long now);
+    struct conn *(*new_conn)(struct dp_packet *pkt, long long now);
     bool (*valid_new)(struct dp_packet *pkt);
     enum ct_update_res (*conn_update)(struct conn *conn,
-                                      struct conntrack_bucket *,
                                       struct dp_packet *pkt, bool reply,
                                       long long now);
     void (*conn_get_protoinfo)(const struct conn *,
                                struct ct_dpif_protoinfo *);
 };
 
-extern struct ct_l4_proto ct_proto_tcp;
-extern struct ct_l4_proto ct_proto_other;
-extern struct ct_l4_proto ct_proto_icmp4;
-extern struct ct_l4_proto ct_proto_icmp6;
+/* Timeouts: all the possible timeout states passed to update_expiration()
+ * are listed here. The name will be prefix by CT_TM_ and the value is in
+ * milliseconds */
+#define CT_TIMEOUTS \
+    CT_TIMEOUT(TCP_FIRST_PACKET, 30 * 1000) \
+    CT_TIMEOUT(TCP_OPENING, 30 * 1000) \
+    CT_TIMEOUT(TCP_ESTABLISHED, 24 * 60 * 60 * 1000) \
+    CT_TIMEOUT(TCP_CLOSING, 15 * 60 * 1000) \
+    CT_TIMEOUT(TCP_FIN_WAIT, 45 * 1000) \
+    CT_TIMEOUT(TCP_CLOSED, 30 * 1000) \
+    CT_TIMEOUT(OTHER_FIRST, 60 * 1000) \
+    CT_TIMEOUT(OTHER_MULTIPLE, 60 * 1000) \
+    CT_TIMEOUT(OTHER_BIDIR, 30 * 1000) \
+    CT_TIMEOUT(ICMP_FIRST, 60 * 1000) \
+    CT_TIMEOUT(ICMP_REPLY, 30 * 1000)
+
+/* The smallest of the above values: it is used as an upper bound for the
+ * interval between two rounds of cleanup of expired entries */
+#define CT_TM_MIN (30 * 1000)
+
+#define CT_TIMEOUT(NAME, VAL) BUILD_ASSERT_DECL(VAL >= CT_TM_MIN);
+    CT_TIMEOUTS
+#undef CT_TIMEOUT
+
+enum ct_timeout {
+#define CT_TIMEOUT(NAME, VALUE) CT_TM_##NAME,
+    CT_TIMEOUTS
+#undef CT_TIMEOUT
+    N_CT_TM
+};
 
 extern long long ct_timeout_val[];
+extern struct ovs_list cm_exp_lists[N_CT_TM];
 
+/* ct_lock must be held. */
 static inline void
-conn_init_expiration(struct conntrack_bucket *ctb, struct conn *conn,
-                        enum ct_timeout tm, long long now)
+conn_init_expiration(struct conn *conn, enum ct_timeout tm, long long now)
 {
     conn->expiration = now + ct_timeout_val[tm];
-    ovs_list_push_back(&ctb->exp_lists[tm], &conn->exp_node);
+    conn->exp_list_id = NO_UPD_EXP_LIST;
+    ovs_list_push_back(&cm_exp_lists[tm], &conn->exp_node);
 }
 
+/* The conn entry lock must be held. */
 static inline void
-conn_update_expiration(struct conntrack_bucket *ctb, struct conn *conn,
-                       enum ct_timeout tm, long long now)
+conn_update_expiration(struct conn *conn, enum ct_timeout tm, long long now)
 {
-    ovs_list_remove(&conn->exp_node);
-    conn_init_expiration(ctb, conn, tm, now);
+    conn->expiration = now + ct_timeout_val[tm];
+    conn->exp_list_id = tm;
 }
 
 static inline uint32_t

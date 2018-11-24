@@ -19,6 +19,7 @@
 
 #include <stdbool.h>
 
+#include "cmap.h"
 #include "latch.h"
 #include "odp-netlink.h"
 #include "openvswitch/hmap.h"
@@ -41,10 +42,6 @@
  * Initialization:
  *
  *    conntrack_init();
- *
- * It is necessary to periodically issue a call to
- *
- * to allow the module to clean up expired connections.
  *
  * To send a group of packets through the connection tracker:
  *
@@ -94,9 +91,8 @@ int conntrack_execute(struct dp_packet_batch *pkt_batch, ovs_be16 dl_type,
 void conntrack_clear(struct dp_packet *packet);
 
 struct conntrack_dump {
-    struct conntrack *ct;
     unsigned bucket;
-    struct hmap_position bucket_pos;
+    struct cmap_position cm_pos;
     bool filter_zone;
     uint16_t zone;
 };
@@ -114,103 +110,5 @@ int conntrack_set_maxconns(uint32_t maxconns);
 int conntrack_get_maxconns(uint32_t *maxconns);
 int conntrack_get_nconns(uint32_t *nconns);
 
-/* 'struct ct_lock' is a wrapper for an adaptive mutex.  It's useful to try
- * different types of locks (e.g. spinlocks) */
-
-struct OVS_LOCKABLE ct_lock {
-    struct ovs_mutex lock;
-};
-
-struct OVS_LOCKABLE ct_rwlock {
-    struct ovs_rwlock lock;
-};
-
-static inline void ct_lock_init(struct ct_lock *lock)
-{
-    ovs_mutex_init_adaptive(&lock->lock);
-}
-
-static inline void ct_lock_lock(struct ct_lock *lock)
-    OVS_ACQUIRES(lock)
-    OVS_NO_THREAD_SAFETY_ANALYSIS
-{
-    ovs_mutex_lock(&lock->lock);
-}
-
-static inline void ct_lock_unlock(struct ct_lock *lock)
-    OVS_RELEASES(lock)
-    OVS_NO_THREAD_SAFETY_ANALYSIS
-{
-    ovs_mutex_unlock(&lock->lock);
-}
-
-static inline void ct_lock_destroy(struct ct_lock *lock)
-{
-    ovs_mutex_destroy(&lock->lock);
-}
-
-static inline void ct_rwlock_init(struct ct_rwlock *lock)
-{
-    ovs_rwlock_init(&lock->lock);
-}
-
-
-static inline void ct_rwlock_wrlock(struct ct_rwlock *lock)
-    OVS_ACQ_WRLOCK(lock)
-    OVS_NO_THREAD_SAFETY_ANALYSIS
-{
-    ovs_rwlock_wrlock(&lock->lock);
-}
-
-static inline void ct_rwlock_rdlock(struct ct_rwlock *lock)
-    OVS_ACQ_RDLOCK(lock)
-    OVS_NO_THREAD_SAFETY_ANALYSIS
-{
-    ovs_rwlock_rdlock(&lock->lock);
-}
-
-static inline void ct_rwlock_unlock(struct ct_rwlock *lock)
-    OVS_RELEASES(lock)
-    OVS_NO_THREAD_SAFETY_ANALYSIS
-{
-    ovs_rwlock_unlock(&lock->lock);
-}
-
-static inline void ct_rwlock_destroy(struct ct_rwlock *lock)
-{
-    ovs_rwlock_destroy(&lock->lock);
-}
-
-
-/* Timeouts: all the possible timeout states passed to update_expiration()
- * are listed here. The name will be prefix by CT_TM_ and the value is in
- * milliseconds */
-#define CT_TIMEOUTS \
-    CT_TIMEOUT(TCP_FIRST_PACKET, 30 * 1000) \
-    CT_TIMEOUT(TCP_OPENING, 30 * 1000) \
-    CT_TIMEOUT(TCP_ESTABLISHED, 24 * 60 * 60 * 1000) \
-    CT_TIMEOUT(TCP_CLOSING, 15 * 60 * 1000) \
-    CT_TIMEOUT(TCP_FIN_WAIT, 45 * 1000) \
-    CT_TIMEOUT(TCP_CLOSED, 30 * 1000) \
-    CT_TIMEOUT(OTHER_FIRST, 60 * 1000) \
-    CT_TIMEOUT(OTHER_MULTIPLE, 60 * 1000) \
-    CT_TIMEOUT(OTHER_BIDIR, 30 * 1000) \
-    CT_TIMEOUT(ICMP_FIRST, 60 * 1000) \
-    CT_TIMEOUT(ICMP_REPLY, 30 * 1000)
-
-/* The smallest of the above values: it is used as an upper bound for the
- * interval between two rounds of cleanup of expired entries */
-#define CT_TM_MIN (30 * 1000)
-
-#define CT_TIMEOUT(NAME, VAL) BUILD_ASSERT_DECL(VAL >= CT_TM_MIN);
-    CT_TIMEOUTS
-#undef CT_TIMEOUT
-
-enum ct_timeout {
-#define CT_TIMEOUT(NAME, VALUE) CT_TM_##NAME,
-    CT_TIMEOUTS
-#undef CT_TIMEOUT
-    N_CT_TM
-};
 
 #endif /* conntrack.h */
