@@ -119,6 +119,35 @@ enum ct_conn_type {
     CT_CONN_TYPE_UN_NAT,
 };
 
+/* Locking:
+ *
+ * The connections are kept in different buckets, which are completely
+ * independent. The connection bucket is determined by the hash of its key.
+ *
+ * Each bucket has two locks. Acquisition order is, from outermost to
+ * innermost:
+ *
+ *    cleanup_mutex
+ *    lock
+ *
+ * */
+struct conntrack_bucket {
+    /* Protects 'connections' and 'exp_lists'.  Used in the fast path */
+    struct ct_lock lock;
+    /* Contains the connections in the bucket, indexed by 'struct conn_key' */
+    struct hmap connections OVS_GUARDED;
+    /* For each possible timeout we have a list of connections. When the
+     * timeout of a connection is updated, we move it to the back of the list.
+     * Since the connection in a list have the same relative timeout, the list
+     * will be ordered, with the oldest connections to the front. */
+    struct ovs_list exp_lists[N_CT_TM] OVS_GUARDED;
+
+    /* Protects 'next_cleanup'. Used to make sure that there's only one thread
+     * performing the cleanup. */
+    struct ovs_mutex cleanup_mutex;
+    long long next_cleanup OVS_GUARDED;
+};
+
 struct ct_l4_proto {
     struct conn *(*new_conn)(struct conntrack_bucket *, struct dp_packet *pkt,
                              long long now);
