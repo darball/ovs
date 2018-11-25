@@ -81,16 +81,11 @@ struct alg_exp_node {
     bool nat_rpl_dst;
 };
 
-struct OVS_LOCKABLE ct_ce_lock {
-    struct ovs_mutex lock;
-};
-
 struct conn {
     struct conn_key key;
     struct conn_key rev_key;
     /* Only used for orig_tuple support. */
     struct conn_key master_key;
-    struct ct_ce_lock lock;
     long long expiration;
     struct ovs_list exp_node;
     struct cmap_node cm_node;
@@ -142,6 +137,9 @@ struct ct_l4_proto {
                                       long long now);
     void (*conn_get_protoinfo)(const struct conn *,
                                struct ct_dpif_protoinfo *);
+    void (*conn_lock)(struct conn *);
+    void (*conn_unlock)(struct conn *);
+    void (*conn_destroy)(struct conn *);
 };
 
 /* Timeouts: all the possible timeout states passed to update_expiration()

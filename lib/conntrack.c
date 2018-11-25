@@ -583,16 +583,43 @@ alg_src_ip_wc(enum ct_alg_ctl_type alg_ctl_type)
 }
 
 static void
+conn_entry_lock(struct conn *conn)
+{
+    struct ct_l4_proto *class = l4_protos[conn->key.nw_proto];
+    if (class->conn_lock) {
+        class->conn_lock(conn);
+    }
+}
+
+static void
+conn_entry_unlock(struct conn *conn)
+{
+    struct ct_l4_proto *class = l4_protos[conn->key.nw_proto];
+    if (class->conn_unlock) {
+        class->conn_unlock(conn);
+    }
+}
+
+static void
+conn_entry_destroy(struct conn *conn)
+{
+    struct ct_l4_proto *class = l4_protos[conn->key.nw_proto];
+    if (class->conn_destroy) {
+        class->conn_destroy(conn);
+    }
+}
+
+static void
 handle_alg_ctl(const struct conn_lookup_ctx *ctx, struct dp_packet *pkt,
-               enum ct_alg_ctl_type ct_alg_ctl, const struct conn *conn,
+               enum ct_alg_ctl_type ct_alg_ctl, struct conn *conn,
                long long now, bool nat)
 {
     /* ALG control packet handling with expectation creation. */
     if (OVS_UNLIKELY(alg_helpers[ct_alg_ctl] && conn && conn->alg)) {
-        ovs_mutex_lock(&conn->lock.lock);
+        conn_entry_lock(conn);
         alg_helpers[ct_alg_ctl](ctx, pkt, conn, now, CT_FTP_CTL_INTEREST,
                                 nat);
-        ovs_mutex_unlock(&conn->lock.lock);
+        conn_entry_unlock(conn);
     }
 }
 
@@ -929,7 +956,6 @@ conn_not_found(struct dp_packet *pkt, struct conn_lookup_ctx *ctx,
         }
 
         nc->nat_conn = nat_conn;
-        ovs_mutex_init_adaptive(&nc->lock.lock);
         nc->conn_type = CT_CONN_TYPE_DEFAULT;
         cmap_insert(&cm_conns, &nc->cm_node, ctx->hash);
         nc->inserted = true;
@@ -1085,23 +1111,23 @@ conn_update_state_alg(struct dp_packet *pkt, struct conn_lookup_ctx *ctx,
     if (is_ftp_ctl(ct_alg_ctl)) {
         /* Keep sequence tracking in sync with the source of the
          * sequence skew. */
-        ovs_mutex_lock(&conn->lock.lock);
+        conn_entry_lock(conn);
         if (ctx->reply != conn->seq_skew_dir) {
             handle_ftp_ctl(ctx, pkt, conn, now, CT_FTP_CTL_OTHER,
                            !!nat_action_info);
             /* conn_update_state locks for unrelated fields, so unlock. */
-            ovs_mutex_unlock(&conn->lock.lock);
+            conn_entry_unlock(conn);
             *create_new_conn = conn_update_state(pkt, ctx, conn, now);
         } else {
             /* conn_update_state locks for unrelated fields, so unlock. */
-            ovs_mutex_unlock(&conn->lock.lock);
+            conn_entry_unlock(conn);
             *create_new_conn = conn_update_state(pkt, ctx, conn, now);
-            ovs_mutex_lock(&conn->lock.lock);
+            conn_entry_lock(conn);
             if (*create_new_conn == false) {
                 handle_ftp_ctl(ctx, pkt, conn, now, CT_FTP_CTL_OTHER,
                                !!nat_action_info);
             }
-            ovs_mutex_unlock(&conn->lock.lock);
+            conn_entry_unlock(conn);
         }
         return true;
     }
@@ -1296,16 +1322,16 @@ ct_sweep(long long now, size_t limit)
     for (unsigned i = 0; i < N_CT_TM; i++) {
         LIST_FOR_EACH_SAFE (conn, next, exp_node, &cm_exp_lists[i]) {
             if (conn->conn_type == CT_CONN_TYPE_DEFAULT) {
-                ovs_mutex_lock(&conn->lock.lock);
+                conn_entry_lock(conn);
                 if (conn->exp_list_id != NO_UPD_EXP_LIST) {
                     ovs_list_remove(&conn->exp_node);
                     ovs_list_push_back(&cm_exp_lists[conn->exp_list_id],
                                        &conn->exp_node);
                     conn->exp_list_id = NO_UPD_EXP_LIST;
-                    ovs_mutex_unlock(&conn->lock.lock);
+                    conn_entry_unlock(conn);
                 } else if (!conn_expired(conn, now) || count >= limit) {
                     /* Not looking at conn changable fields. */
-                    ovs_mutex_unlock(&conn->lock.lock);
+                    conn_entry_unlock(conn);
                     min_expiration = MIN(min_expiration, conn->expiration);
                     if (count >= limit) {
                         /* Do not check other lists. */
@@ -1315,7 +1341,7 @@ ct_sweep(long long now, size_t limit)
                     break;
                 } else {
                     /* Not looking at conn changable fields. */
-                    ovs_mutex_unlock(&conn->lock.lock);
+                    conn_entry_unlock(conn);
                     if (conn->inserted) {
                         conn_clean(conn);
                     } else {
@@ -2173,7 +2199,7 @@ delete_conn(struct conn *conn)
     if (conn->conn_type == CT_CONN_TYPE_DEFAULT) {
         free(conn->nat_info);
         free(conn->alg);
-        ovs_mutex_destroy(&conn->lock.lock);
+        conn_entry_destroy(conn);
         if (conn->nat_conn) {
             free(conn->nat_conn);
         }
@@ -2187,7 +2213,7 @@ delete_conn_one(struct conn *conn)
     if (conn->conn_type == CT_CONN_TYPE_DEFAULT) {
         free(conn->nat_info);
         free(conn->alg);
-        ovs_mutex_destroy(&conn->lock.lock);
+        conn_entry_destroy(conn);
     }
     free(conn);
 }

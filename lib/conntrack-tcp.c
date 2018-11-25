@@ -54,6 +54,7 @@ struct tcp_peer {
 struct conn_tcp {
     struct conn up;
     struct tcp_peer peer[2];
+    struct ovs_mutex lock;
 };
 
 enum {
@@ -144,10 +145,34 @@ tcp_get_wscale(const struct tcp_header *tcp)
     return wscale;
 }
 
+static void
+tcp_conn_lock(struct conn *conn_)
+    OVS_NO_THREAD_SAFETY_ANALYSIS
+{
+    struct conn_tcp *conn = conn_tcp_cast(conn_);
+    ovs_mutex_lock(&conn->lock);
+}
+
+static void
+tcp_conn_unlock(struct conn *conn_)
+    OVS_NO_THREAD_SAFETY_ANALYSIS
+{
+    struct conn_tcp *conn = conn_tcp_cast(conn_);
+    ovs_mutex_unlock(&conn->lock);
+}
+
+static void
+tcp_conn_destroy(struct conn *conn_)
+{
+    struct conn_tcp *conn = conn_tcp_cast(conn_);
+    ovs_mutex_destroy(&conn->lock);
+}
+
 static enum ct_update_res
 tcp_conn_update(struct conn *conn_, struct dp_packet *pkt, bool reply,
                 long long now)
 {
+    tcp_conn_lock(conn_);
     struct conn_tcp *conn = conn_tcp_cast(conn_);
     struct tcp_header *tcp = dp_packet_l4(pkt);
     /* The peer that sent 'pkt' */
@@ -156,20 +181,23 @@ tcp_conn_update(struct conn *conn_, struct dp_packet *pkt, bool reply,
     struct tcp_peer *dst = &conn->peer[reply ? 0 : 1];
     uint8_t sws = 0, dws = 0;
     uint16_t tcp_flags = TCP_FLAGS(tcp->tcp_ctl);
+    enum ct_update_res rc = CT_UPDATE_VALID;
 
     uint16_t win = ntohs(tcp->tcp_winsz);
     uint32_t ack, end, seq, orig_seq;
     uint32_t p_len = tcp_payload_length(pkt);
 
     if (tcp_invalid_flags(tcp_flags)) {
-        return CT_UPDATE_INVALID;
+        rc = CT_UPDATE_INVALID;
+        goto out;
     }
 
     if (((tcp_flags & (TCP_SYN | TCP_ACK)) == TCP_SYN)
         && dst->state >= CT_DPIF_TCPS_FIN_WAIT_2
         && src->state >= CT_DPIF_TCPS_FIN_WAIT_2) {
         src->state = dst->state = CT_DPIF_TCPS_CLOSED;
-        return CT_UPDATE_NEW;
+        rc = CT_UPDATE_NEW;
+        goto out;
     }
 
     if (src->wscale & CT_WSCALE_FLAG
@@ -385,10 +413,13 @@ tcp_conn_update(struct conn *conn_, struct dp_packet *pkt, bool reply,
             src->state = dst->state = CT_DPIF_TCPS_TIME_WAIT;
         }
     } else {
-        return CT_UPDATE_INVALID;
+        rc = CT_UPDATE_INVALID;
+        goto out;
     }
 
-    return CT_UPDATE_VALID;
+out:
+    tcp_conn_unlock(conn_);
+    return rc;
 }
 
 static bool
@@ -448,6 +479,7 @@ tcp_new_conn(struct dp_packet *pkt, long long now)
     src->state = CT_DPIF_TCPS_SYN_SENT;
     dst->state = CT_DPIF_TCPS_CLOSED;
     conn_init_expiration(&newconn->up, CT_TM_TCP_FIRST_PACKET, now);
+    ovs_mutex_init_adaptive(&newconn->lock);
 
     return &newconn->up;
 }
@@ -490,4 +522,7 @@ struct ct_l4_proto ct_proto_tcp = {
     .valid_new = tcp_valid_new,
     .conn_update = tcp_conn_update,
     .conn_get_protoinfo = tcp_conn_get_protoinfo,
+    .conn_lock = tcp_conn_lock,
+    .conn_unlock = tcp_conn_unlock,
+    .conn_destroy = tcp_conn_destroy,
 };
