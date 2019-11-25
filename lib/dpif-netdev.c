@@ -7363,6 +7363,7 @@ dp_netdev_execute_actions(struct dp_netdev_pmd_thread *pmd,
 {
     struct dp_netdev_execute_aux aux = { pmd, flow };
 
+    dp_packet_batch_set_action_ctx(packets, actions, actions_len);
     odp_execute_actions(&aux, packets, should_steal, actions,
                         actions_len, dp_execute_cb);
 }

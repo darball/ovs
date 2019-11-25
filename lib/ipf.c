@@ -91,6 +91,8 @@ union ipf_addr {
 /* Represents a single fragment; part of a list of fragments. */
 struct ipf_frag {
     struct dp_packet *pkt;
+    const struct nlattr *actions;
+    size_t actions_len;
     uint16_t start_data_byte;
     uint16_t end_data_byte;
     bool dnsteal; /* 'do not steal': if true, ipf should not free packet. */
@@ -793,7 +795,7 @@ static bool
 ipf_process_frag(struct ipf *ipf, struct ipf_list *ipf_list,
                  struct dp_packet *pkt, uint16_t start_data_byte,
                  uint16_t end_data_byte, bool ff, bool lf, bool v6,
-                 bool dnsteal)
+                 struct dp_packet_batch *pb)
     OVS_REQUIRES(ipf->ipf_lock)
 {
     bool duped_frag = ipf_is_frag_duped(ipf_list->frag_list,
@@ -811,7 +813,11 @@ ipf_process_frag(struct ipf *ipf, struct ipf_list *ipf_list,
             frag->pkt = pkt;
             frag->start_data_byte = start_data_byte;
             frag->end_data_byte = end_data_byte;
-            frag->dnsteal = dnsteal;
+            frag->dnsteal = pb->do_not_steal;
+            frag->actions_len = dp_packet_batch_get_action_len(pb);
+            ovs_assert(dp_packet_batch_get_actions(pb));
+            frag->actions = xmemdup(dp_packet_batch_get_actions(pb),
+                                    frag->actions_len);
             ipf_list->last_inuse_idx++;
             atomic_count_inc(&ipf->nfrag);
             ipf_count(ipf, v6, IPF_NFRAGS_ACCEPTED);
@@ -849,7 +855,7 @@ ipf_list_init(struct ipf_list *ipf_list, struct ipf_list_key *key,
 static bool
 ipf_handle_frag(struct ipf *ipf, struct dp_packet *pkt, ovs_be16 dl_type,
                 uint16_t zone, long long now, uint32_t hash_basis,
-                bool dnsteal)
+                struct dp_packet_batch *pb)
     OVS_REQUIRES(ipf->ipf_lock)
 {
     struct ipf_list_key key;
@@ -918,7 +924,7 @@ ipf_handle_frag(struct ipf *ipf, struct dp_packet *pkt, ovs_be16 dl_type,
     }
 
     return ipf_process_frag(ipf, ipf_list, pkt, start_data_byte,
-                            end_data_byte, ff, lf, v6, dnsteal);
+                            end_data_byte, ff, lf, v6, pb);
 }
 
 /* Filters out fragments from a batch of fragments and adjust the batch. */
@@ -940,7 +946,7 @@ ipf_extract_frags_from_batch(struct ipf *ipf, struct dp_packet_batch *pb,
 
             ovs_mutex_lock(&ipf->ipf_lock);
             if (!ipf_handle_frag(ipf, pkt, dl_type, zone, now, hash_basis,
-                                 pb->do_not_steal)) {
+                                 pb)) {
                 dp_packet_batch_refill(pb, pkt, pb_idx);
             }
             ovs_mutex_unlock(&ipf->ipf_lock);
@@ -954,20 +960,30 @@ ipf_extract_frags_from_batch(struct ipf *ipf, struct dp_packet_batch *pb,
  * management has trouble dealing with multiple source types.  The
  * check_source paramater is used to indicate when this check is needed. */
 static bool
-ipf_dp_packet_batch_add(struct dp_packet_batch *pb , struct dp_packet *pkt,
-                        bool check_source OVS_UNUSED)
+ipf_dp_packet_batch_add(struct dp_packet_batch *pb, struct dp_packet *pkt,
+                        struct ipf_frag *frag, bool check_source OVS_UNUSED)
 {
 #ifdef DPDK_NETDEV
     if ((dp_packet_batch_is_full(pb)) ||
         /* DPDK cannot handle multiple sources in a batch. */
         (check_source && !dp_packet_batch_is_empty(pb)
-         && pb->packets[0]->source != pkt->source)) {
+         && pb->packets[0]->source != frag->pkt->source)) {
 #else
     if (dp_packet_batch_is_full(pb)) {
 #endif
         return false;
     }
 
+    /* Make sure that the fragment resumes processing in the same action list.
+     * There is a semantic requirement that an action list have a single
+     * conntrack action, which could be enforced when the action list is
+     * generated.  Netlink padding is predictably zero, hence memcmp should
+     * be reliable to compare action lists. */
+    if ((dp_packet_batch_get_action_len(pb) != frag->actions_len) ||
+        (memcmp(dp_packet_batch_get_actions(pb), frag->actions,
+                frag->actions_len))) {
+        return false;
+    }
     dp_packet_batch_add(pb, pkt);
     return true;
 }
@@ -1020,9 +1036,11 @@ ipf_send_frags_in_list(struct ipf *ipf, struct ipf_list *ipf_list,
     }
 
     while (ipf_list->last_sent_idx < ipf_list->last_inuse_idx) {
-        struct dp_packet *pkt
-            = ipf_list->frag_list[ipf_list->last_sent_idx + 1].pkt;
-        if (ipf_dp_packet_batch_add(pb, pkt, true)) {
+        struct ipf_frag *frag =
+            &ipf_list->frag_list[ipf_list->last_sent_idx + 1];
+        struct dp_packet *pkt = frag->pkt;
+
+        if (ipf_dp_packet_batch_add(pb, pkt, frag, true)) {
             ipf_list->last_sent_idx++;
             atomic_count_dec(&ipf->nfrag);
 
@@ -1122,7 +1140,7 @@ ipf_execute_reass_pkts(struct ipf *ipf, struct dp_packet_batch *pb)
 
     LIST_FOR_EACH_SAFE (rp, next, rp_list_node, &ipf->reassembled_pkt_list) {
         if (!rp->list->reass_execute_ctx &&
-            ipf_dp_packet_batch_add(pb, rp->pkt, false)) {
+            ipf_dp_packet_batch_add(pb, rp->pkt, rp->list->frag_list, false)) {
             rp->list->reass_execute_ctx = rp->pkt;
         }
     }
