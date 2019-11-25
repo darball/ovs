@@ -775,9 +775,11 @@ enum { NETDEV_MAX_BURST = 32 }; /* Maximum number packets in a batch. */
 
 struct dp_packet_batch {
     size_t count;
+    size_t actions_len;
+    const struct nlattr *actions;
+    struct dp_packet *packets[NETDEV_MAX_BURST];
     bool trunc; /* true if the batch needs truncate. */
     bool do_not_steal; /* Indicate that the packets should not be stolen. */
-    struct dp_packet *packets[NETDEV_MAX_BURST];
 };
 
 static inline void
@@ -786,6 +788,8 @@ dp_packet_batch_init(struct dp_packet_batch *batch)
     batch->count = 0;
     batch->trunc = false;
     batch->do_not_steal = false;
+    batch->actions = NULL;
+    batch->actions_len = 0;
 }
 
 static inline void
@@ -928,6 +932,27 @@ dp_packet_batch_reset_cutlen(struct dp_packet_batch *batch)
         }
         batch->trunc = false;
     }
+}
+
+static inline void
+dp_packet_batch_set_action_ctx(struct dp_packet_batch *batch,
+                               const struct nlattr *actions,
+                               size_t actions_len)
+{
+    batch->actions = actions;
+    batch->actions_len = actions_len;
+}
+
+static inline const struct nlattr *
+dp_packet_batch_get_actions(struct dp_packet_batch *batch)
+{
+    return batch->actions;
+}
+
+static inline size_t
+dp_packet_batch_get_action_len(struct dp_packet_batch *batch)
+{
+    return batch->actions_len;
 }
 
 #ifdef  __cplusplus
